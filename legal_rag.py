@@ -1,8 +1,7 @@
-"""Minimal, reusable implementation of the paper's retrieval approach.
+"""Reference implementation of the paper's retrieval approach.
 
 Input: JSONL judgments with id, year, text, and optional cited case IDs.
-The parser is intentionally adaptable to a jurisdiction's headings/citation IDs.
-No benchmark results or evaluation labels are bundled with this module.
+The parser can be adapted to a jurisdiction's headings and citation IDs.
 """
 from __future__ import annotations
 
@@ -133,57 +132,70 @@ def normalize(values: dict[int, float]) -> dict[int, float]:
             for i, value in values.items()}
 
 
+class SearchEngine:
+    """Load the corpus index and models once for repeated queries."""
+
+    def __init__(self, directory: Path, reranker_checkpoint: str | None = None):
+        cfg = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        self.chunks = [json.loads(line) for line in
+                       (directory / "chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.index = faiss.read_index(str(directory / "dense.faiss"))
+        self.index.hnsw.efSearch = int(cfg["ef_search"])
+        self.encoder = Encoder(cfg["model"])
+        self.bm25 = BM25Okapi([tokens(c["text"]) for c in self.chunks])
+        self.by_id = defaultdict(list)
+        for c in self.chunks:
+            if c["role"] in REASONING:
+                self.by_id[c["doc_id"]].append(c)
+        self.reranker = None
+        if reranker_checkpoint:
+            from sentence_transformers import CrossEncoder
+            self.reranker = CrossEncoder(reranker_checkpoint)
+
+    def search(self, query: str, k: int = 10, before_year: int | None = None,
+               exclude_doc_id: str | None = None) -> list[dict]:
+        if k < 1 or not query.strip():
+            raise ValueError("Require nonempty query and top-k >= 1")
+        candidate_count = max(50, k * 10)
+        lexical = self.bm25.get_scores(tokens(query))
+        lexical_ids = np.argsort(lexical)[::-1][:candidate_count]
+        distances, dense_ids = self.index.search(self.encoder.encode([query]), candidate_count)
+        dense = {int(i): float(score) for i, score in zip(dense_ids[0], distances[0]) if i >= 0}
+        lex = {int(i): float(lexical[i]) for i in lexical_ids}
+        dn, ln = normalize(dense), normalize(lex)
+        by_doc: dict[str, dict] = {}
+        for i in set(dn) | set(ln):
+            c = self.chunks[i]
+            if (before_year is not None and c["year"] >= before_year) or c["doc_id"] == exclude_doc_id:
+                continue
+            role = 1.0 if c["role"] in REASONING else 0.5
+            score = .45 * dn.get(i, 0.0) + .30 * ln.get(i, 0.0) + .15 * role
+            if c["doc_id"] not in by_doc or score > by_doc[c["doc_id"]]["score"]:
+                by_doc[c["doc_id"]] = {**c, "score": score, "source": "retrieval"}
+        initial = sorted(by_doc.values(), key=lambda c: c["score"], reverse=True)
+        cited = []
+        for c in initial[:3]:
+            cited.extend(c["citations"])
+        for doc_id in dict.fromkeys(cited):
+            if doc_id in by_doc or doc_id == exclude_doc_id or not self.by_id.get(doc_id):
+                continue
+            c = self.by_id[doc_id][0]
+            if before_year is not None and c["year"] >= before_year:
+                continue
+            by_doc[doc_id] = {**c, "score": .10, "source": "citation"}
+        candidates = sorted(by_doc.values(), key=lambda c: c["score"], reverse=True)
+        if self.reranker and candidates:
+            top = candidates[:50]
+            scores = self.reranker.predict([(query, c["text"]) for c in top])
+            for c, score in zip(top, scores):
+                c["rerank_score"] = float(score)
+            candidates[:50] = sorted(top, key=lambda c: c["rerank_score"], reverse=True)
+        return candidates[:k]
+
+
 def search(directory: Path, query: str, k: int, before_year: int | None,
-           reranker_checkpoint: str | None) -> list[dict]:
-    cfg = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-    chunks = [json.loads(line) for line in
-              (directory / "chunks.jsonl").read_text(encoding="utf-8").splitlines()]
-    index = faiss.read_index(str(directory / "dense.faiss"))
-    index.hnsw.efSearch = int(cfg["ef_search"])
-    encoder = Encoder(cfg["model"])
-    bm25 = BM25Okapi([tokens(c["text"]) for c in chunks])
-    lexical = bm25.get_scores(tokens(query))
-    lexical_ids = np.argsort(lexical)[::-1][: max(50, k * 10)]
-    distances, dense_ids = index.search(encoder.encode([query]), max(50, k * 10))
-    dense = {int(i): float(score) for i, score in zip(dense_ids[0], distances[0]) if i >= 0}
-    lex = {int(i): float(lexical[i]) for i in lexical_ids}
-    dn, ln = normalize(dense), normalize(lex)
-    by_doc: dict[str, dict] = {}
-    for i in set(dn) | set(ln):
-        c = chunks[i]
-        if before_year is not None and c["year"] >= before_year:
-            continue
-        role = 1.0 if c["role"] in REASONING else 0.5
-        score = .45 * dn.get(i, 0.0) + .30 * ln.get(i, 0.0) + .15 * role
-        if c["doc_id"] not in by_doc or score > by_doc[c["doc_id"]]["score"]:
-            by_doc[c["doc_id"]] = {**c, "score": score, "source": "retrieval"}
-    initial = sorted(by_doc.values(), key=lambda c: c["score"], reverse=True)
-    # Resolve explicitly supplied citation IDs; a corpus-specific citation extractor
-    # may populate this field during preprocessing.
-    by_id = defaultdict(list)
-    for c in chunks:
-        if c["role"] in REASONING:
-            by_id[c["doc_id"]].append(c)
-    cited = []
-    for c in initial[:3]:
-        cited.extend(c["citations"])
-    for doc_id in dict.fromkeys(cited):
-        if doc_id in by_doc or not by_id.get(doc_id):
-            continue
-        c = by_id[doc_id][0]
-        if before_year is not None and c["year"] >= before_year:
-            continue
-        by_doc[doc_id] = {**c, "score": .10, "source": "citation"}
-    candidates = sorted(by_doc.values(), key=lambda c: c["score"], reverse=True)
-    if reranker_checkpoint:
-        from sentence_transformers import CrossEncoder
-        reranker = CrossEncoder(reranker_checkpoint)
-        top = candidates[:50]
-        scores = reranker.predict([(query, c["text"]) for c in top])
-        for c, score in zip(top, scores):
-            c["rerank_score"] = float(score)
-        candidates[:50] = sorted(top, key=lambda c: c["rerank_score"], reverse=True)
-    return candidates[:k]
+           reranker_checkpoint: str | None, exclude_doc_id: str | None = None) -> list[dict]:
+    return SearchEngine(directory, reranker_checkpoint).search(query, k, before_year, exclude_doc_id)
 
 
 def main() -> None:
@@ -200,13 +212,14 @@ def main() -> None:
     s.add_argument("query")
     s.add_argument("--top-k", type=int, default=10)
     s.add_argument("--before-year", type=int)
+    s.add_argument("--exclude-doc-id", help="Exclude the source judgment itself")
     s.add_argument("--reranker", help="Compatible CrossEncoder checkpoint")
     args = parser.parse_args()
     if args.command == "build":
         build(args.corpus, args.index, args.model, args.chunk_size, args.overlap)
     else:
         for result in search(args.index, args.query, args.top_k,
-                             args.before_year, args.reranker):
+                             args.before_year, args.reranker, args.exclude_doc_id):
             print(json.dumps(result, ensure_ascii=False))
 
 

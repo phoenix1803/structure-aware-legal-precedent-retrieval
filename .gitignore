@@ -10,6 +10,8 @@ __pycache__/
 results/
 archive/
 index/
+example-checkpoint/
+*.jsonl
 *.faiss
 *.npy
 *.pkl

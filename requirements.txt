@@ -3,4 +3,4 @@ numpy
 rank-bm25
 torch
 transformers
-sentence-transformers
+sentence-transformers>=2.2.2,<3
