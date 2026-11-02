@@ -1,0 +1,15 @@
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+build/
+__pycache__/
+.ipynb_checkpoints/
+results/
+archive/
+index/
+*.faiss
+*.npy
+*.pkl
